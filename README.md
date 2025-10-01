@@ -9,14 +9,16 @@ Quickly upload and download with GoFile.io.
 - Download Files CLI
 
 ## Installation
+simply run:
 ```bash
 sudo wget https://raw.githubusercontent.com/officialputuid/GoFileCLI/refs/heads/main/gfcli.sh
 ```
 
 ## Usage
+simply run:
 ```bash
 . gfcli.sh
 ```
 
-## Usage
+## Credits
 - gofile.io, An amazing website to upload unlimited files of any size to fast servers, completely free!
