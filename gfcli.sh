@@ -1,137 +1,276 @@
 #!/bin/bash
-set -u
+set -uo pipefail
 
-API="https://api.gofile.io"
-UA="Mozilla/5.0"
-QS="wt=4fd6sg89d7s6&cache=true&sortField=createTime&sortDirection=1"
+# Configuration
+API_BASE="${API_BASE:-https://api.gofile.io}"
+USER_AGENT="${USER_AGENT:-Mozilla/5.0}"
 GF_TOKEN="${GF_TOKEN:-}"
 
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
-need curl; need jq; need sed; need grep; need awk; need sha256sum
+# Utility functions
+log() { printf "%s\n" "$*" >&2; }
 
-log(){ printf "%s\n" "$*" >&2; }
+check_dependencies() {
+  local deps=(curl jq awk du)
+  for cmd in "${deps[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+      log "Error: Required command '$cmd' not found"
+      exit 1
+    }
+  done
+}
 
-mk_token(){
+sha256hex() {
+  printf %s "$1" | sha256sum | awk '{print $1}'
+}
+
+# API functions
+create_guest_token() {
   [[ -n "$GF_TOKEN" ]] && return 0
-  GF_TOKEN="$(curl -sS -X POST "$API/accounts" -H 'Content-Type: application/json' -d '{}' \
-    | jq -r 'select(.status=="ok")|.data.token' 2>/dev/null || true)"
-  [[ -n "$GF_TOKEN" ]] || { log "Gagal membuat token guest."; return 1; }
-}
 
-sha256hex(){ printf %s "$1" | sha256sum | awk '{print $1}'; }
+  GF_TOKEN=$(curl -sS -X POST "$API_BASE/accounts" \
+    -H 'Content-Type: application/json' \
+    -d '{}' | jq -r '.data.token // empty' 2>/dev/null)
 
-get_json(){
-  local cid="$1" passhex="${2:-}"
-  local url="$API/contents/$cid?$QS"
-  [[ -n "$passhex" ]] && url+="&password=$passhex"
-  curl -sS -A "$UA" -H "Authorization: Bearer $GF_TOKEN" "$url" 2>/dev/null || true
-}
-
-download_file(){
-  local path="$1" link="$2"
-  mkdir -p "$(dirname "$path")"
-  if curl -L --fail -C - -A "$UA" -o "$path" "$link" 2>/dev/null; then
-    echo "OK: $path"
-  else
-    log "Download gagal: $path"
+  if [[ -z "$GF_TOKEN" ]]; then
+    log "Error: Failed to create guest token"
+    return 1
   fi
 }
 
-traverse_download(){
-  local root="$1" id="$2" passhex="${3:-}"
-  local j; j="$(get_json "$id" "$passhex")"
-  [[ -n "$j" ]] || { log "Fetch gagal: $id"; return 1; }
-  local st; st="$(jq -r '.status' <<<"$j" 2>/dev/null)"
-  [[ "$st" == "ok" ]] || { log "Status bukan ok: $(jq -r '.message? // empty' <<<"$j")"; return 1; }
+get_content_info() {
+  local content_id="$1"
+  local password_hash="${2:-}"
+  local url="$API_BASE/contents/$content_id?wt=4fd6sg89d7s6"
 
-  local pstat; pstat="$(jq -r '.data.passwordStatus? // "passwordOk"' <<<"$j" 2>/dev/null)"
-  [[ "$pstat" == "passwordOk" ]] || { log "Password salah/kurang untuk $id"; return 1; }
+  [[ -n "$password_hash" ]] && url+="&password=$password_hash"
 
-  local typ name; typ="$(jq -r '.data.type' <<<"$j" 2>/dev/null)"; name="$(jq -r '.data.name' <<<"$j" 2>/dev/null)"
+  curl -sS -A "$USER_AGENT" \
+    -H "Authorization: Bearer $GF_TOKEN" \
+    "$url" 2>/dev/null
+}
 
-  if [[ "$typ" == "file" ]]; then
-    local link; link="$(jq -r '.data.link' <<<"$j" 2>/dev/null)"
-    download_file "$root/$name" "$link"
-    return 0
+get_upload_server() {
+  curl -sS "$API_BASE/servers" \
+    | jq -r '.data.servers[0].name // empty'
+}
+
+# Download functions
+download_file() {
+  local output_path="$1"
+  local download_link="$2"
+  local max_retries=3
+
+  mkdir -p "$(dirname "$output_path")"
+
+  for ((attempt=1; attempt<=max_retries; attempt++)); do
+    echo "🕔 Downloading: $output_path (attempt $attempt/$max_retries)"
+
+    if curl -L --progress-bar --fail -C - \
+      -A "$USER_AGENT" \
+      -H "Authorization: Bearer $GF_TOKEN" \
+      -o "$output_path" "$download_link"; then
+      
+      local file_size
+      file_size=$(du -h "$output_path" | awk '{print $1}')
+      echo "✅ Downloaded: $output_path ($file_size)"
+      return 0
+    fi
+
+    [[ $attempt -lt $max_retries ]] && sleep 2
+  done
+
+  log "❌ Failed to download after $max_retries attempts: $output_path"
+  return 1
+}
+
+download_content() {
+  local base_path="$1"
+  local content_id="$2"
+  local password_hash="${3:-}"
+
+  local response
+  response=$(get_content_info "$content_id" "$password_hash")
+
+  if [[ -z "$response" ]]; then
+    log "⚠️  Empty response for content ID: $content_id"
+    return 1
   fi
 
-  mkdir -p "$root/$name"
-  jq -c '.data.children | to_entries[]' <<<"$j" 2>/dev/null | while read -r e; do
-    local ctype cid cname clink
-    ctype="$(jq -r '.value.type' <<<"$e" 2>/dev/null)"
-    cid="$(jq -r   '.value.id'   <<<"$e" 2>/dev/null)"
-    cname="$(jq -r '.value.name' <<<"$e" 2>/dev/null)"
-    if [[ "$ctype" == "folder" ]]; then
-      traverse_download "$root/$name" "$cid" "$passhex"
+  local status password_status
+  status=$(jq -r '.status // empty' <<<"$response")
+  password_status=$(jq -r '.data.passwordStatus // "passwordOk"' <<<"$response")
+
+  if [[ "$status" != "ok" ]]; then
+    log "⚠️  API error: $(jq -r '.message // "Unknown error"' <<<"$response")"
+    return 1
+  fi
+
+  if [[ "$password_status" != "passwordOk" ]]; then
+    log "⚠️  Invalid or missing password for content ID: $content_id"
+    return 1
+  fi
+
+  local content_type content_name
+  content_type=$(jq -r '.data.type' <<<"$response")
+  content_name=$(jq -r '.data.name' <<<"$response")
+
+  if [[ "$content_type" == "file" ]]; then
+    local download_link
+    download_link=$(jq -r '.data.link' <<<"$response")
+    echo "📄 File: $content_name"
+    download_file "$base_path/$content_name" "$download_link"
+    return
+  fi
+
+  # Handle folder
+  local folder_path="$base_path/$content_name"
+  mkdir -p "$folder_path"
+  echo "📁 Folder: $content_name"
+
+  jq -c '.data.children | to_entries[]' <<<"$response" 2>/dev/null | while IFS= read -r entry; do
+    local child_type child_id child_name child_link
+    child_type=$(jq -r '.value.type' <<<"$entry")
+    child_id=$(jq -r '.value.id' <<<"$entry")
+    child_name=$(jq -r '.value.name' <<<"$entry")
+
+    if [[ "$child_type" == "folder" ]]; then
+      download_content "$folder_path" "$child_id" "$password_hash"
     else
-      clink="$(jq -r '.value.link' <<<"$e" 2>/dev/null)"
-      download_file "$root/$name/$cname" "$clink"
+      child_link=$(jq -r '.value.link' <<<"$entry")
+      echo "📥 File: $child_name"
+      download_file "$folder_path/$child_name" "$child_link"
     fi
   done
 }
 
-get_upload_server(){
-  curl -sS "https://api.gofile.io/servers" \
-    | jq -r 'select(.status=="ok") | .data.servers[0].name'
-}
+# Upload function
+upload_file() {
+  local file_path="$1"
+  local max_retries=3
 
-upload_file(){
-  local fpath="$1"
-  [[ -f "$fpath" ]] || { log "File tidak ditemukan: $fpath"; return 1; }
-
-  local server; server="$(get_upload_server)"
-  [[ -n "$server" ]] || { log "Gagal dapat server upload."; return 1; }
-
-  local res; res="$(
-    curl -sS -A "$UA" -H "Authorization: Bearer $GF_TOKEN" \
-      -F "file=@${fpath}" -F "folderId=" \
-      "https://${server}.gofile.io/uploadFile" 2>/dev/null || true
-  )"
-
-  if [[ "$(jq -r '.status // empty' <<<"$res" 2>/dev/null)" == "ok" ]]; then
-    local dlink; dlink="$(jq -r '.data.downloadPage' <<<"$res" 2>/dev/null)"
-    echo "Uploaded: ${dlink}"
-  else
-    log "Upload gagal: $(jq -r '.message? // empty' <<<"$res")"
+  if [[ ! -f "$file_path" ]]; then
+    log "❌ File not found: $file_path"
+    return 1
   fi
+
+  local server
+  server=$(get_upload_server)
+
+  if [[ -z "$server" ]]; then
+    log "❌ Failed to get upload server"
+    return 1
+  fi
+
+  local file_size
+  file_size=$(du -h "$file_path" | awk '{print $1}')
+
+  for ((attempt=1; attempt<=max_retries; attempt++)); do
+    echo "🚀 Uploading: $file_path ($file_size) → server: $server (attempt $attempt/$max_retries)"
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    curl --progress-bar -A "$USER_AGENT" \
+      -H "Authorization: Bearer $GF_TOKEN" \
+      -F "file=@${file_path}" \
+      -o "$temp_file" \
+      "https://${server}.gofile.io/uploadFile"
+
+    local response
+    response=$(cat "$temp_file")
+    rm -f "$temp_file"
+
+    local status
+    status=$(jq -r '.status // empty' <<<"$response" 2>/dev/null)
+
+    if [[ "$status" == "ok" ]]; then
+      local download_link
+      download_link=$(jq -r '.data.downloadPage' <<<"$response")
+
+      echo "✅ Upload complete: $file_path ($file_size)"
+      echo "🔗 Download link: $download_link"
+      return 0
+    fi
+
+    local error_msg
+    error_msg=$(jq -r '.message // "Unknown error"' <<<"$response" 2>/dev/null)
+    log "⚠️  Upload failed: $error_msg"
+
+    [[ $attempt -lt $max_retries ]] && sleep 2
+  done
+
+  log "❌ Failed to upload after $max_retries attempts: $file_path"
+  return 1
 }
 
-menu_download(){
-  read -rp "Masukkan URL Gofile (https://gofile.io/d/<ID>): " URL
-  read -rsp "Password (jika ada, Enter jika tidak): " PASS; echo
-  local id; id="$(awk -F'/d/' '{print $2}' <<<"$URL" | cut -d/ -f1)"
-  [[ -n "$id" ]] || { log "URL tidak valid."; return; }
-  local passhex=""; [[ -n "$PASS" ]] && passhex="$(sha256hex "$PASS")"
-  mk_token || return
-  local outdir; outdir="$(pwd)/$id"
-  echo "Download ke: $outdir"
-  traverse_download "$(pwd)" "$id" "$passhex" || log "Selesai dengan beberapa error."
-  echo "Selesai → $outdir"
+# Menu functions
+menu_download() {
+  read -rp "Enter Gofile URL (https://gofile.io/d/<ID>): " url
+  read -rsp "Password (press Enter if none): " password
+  echo
+
+  local content_id
+  content_id=$(awk -F'/d/' '{print $2}' <<<"$url" | cut -d/ -f1)
+
+  if [[ -z "$content_id" ]]; then
+    log "Invalid URL format"
+    return 1
+  fi
+
+  local password_hash=""
+  [[ -n "$password" ]] && password_hash=$(sha256hex "$password")
+
+  create_guest_token || return 1
+
+  local output_dir="$PWD/$content_id"
+  echo "Downloading to: $output_dir"
+
+  download_content "$PWD" "$content_id" "$password_hash" || \
+    log "Download completed with some errors"
+
+  echo "✅ Completed, check your file here → $output_dir/*"
 }
 
-menu_upload(){
-  read -rp "Path file yang diupload: " FP
-  mk_token || return
-  upload_file "$FP"
+menu_upload() {
+  echo -n "Enter file path to upload: "
+  read -e -r file_path
+
+  create_guest_token || return 1
+  upload_file "$file_path"
 }
 
-while :; do
-  echo -e "\n  ____       _____ _ _        ____ _     ___ "
-  echo -e " / ___| ___ |  ___(_) | ___  / ___| |   |_ _|"
-  echo -e "| |  _ / _ \| |_  | | |/ _ \| |   | |    | | "
-  echo -e "| |_| | (_) |  _| | | |  __/| |___| |___ | | "
-  echo -e " \____|\___/|_|   |_|_|\___| \____|_____|___|"
-  echo -e ""
-  echo -e "by officialputuid\n"
+show_banner() {
+  cat << 'EOF'
 
-  echo "1) Download"
-  echo "2) Upload"
-  echo "3) Keluar"
-  read -rp "Pilih [1/2/3]: " ch
-  case "${ch:-}" in
-    1) menu_download ;;
-    2) menu_upload ;;
-    3) break ;;
-    *) echo "Pilihan tidak dikenal." ;;
-  esac
-done
+  ____       _____ _ _        ____ _     ___ 
+ / ___| ___ |  ___(_) | ___  / ___| |   |_ _|
+| |  _ / _ \| |_  | | |/ _ \| |   | |    | | 
+| |_| | (_) |  _| | | |  __/| |___| |___ | | 
+ \____|\___/|_|   |_|_|\___| \____|_____|___|
+
+by officialputuid
+
+EOF
+}
+
+# Main program
+main() {
+  check_dependencies
+
+  while true; do
+    show_banner
+    echo "1) Download"
+    echo "2) Upload"
+    echo "3) Exit"
+    read -rp "Choose [1/2/3]: " choice
+
+    case "${choice}" in
+      1) menu_download ;;
+      2) menu_upload ;;
+      3) echo "Goodbye!"; break ;;
+      *) log "Invalid choice" ;;
+    esac
+  done
+}
+
+main
